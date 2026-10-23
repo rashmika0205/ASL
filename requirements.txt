@@ -1,7 +1,7 @@
 Flask
 gunicorn
-joblib
-mediapipe
-numpy<2
 opencv-python-headless
+mediapipe
 scikit-learn
+numpy
+joblib
