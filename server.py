@@ -1,4 +1,4 @@
-# server.py - SignLab backend (Web-ready version)
+# server.py - SignLab backend (Cloud Web Version)
 import base64
 import datetime
 import glob
@@ -13,7 +13,7 @@ import cv2
 import joblib
 import mediapipe as mp
 import numpy as np
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, render_template, request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -23,12 +23,15 @@ from preprocess import extract_frame_raw, resample_by_time, sequence_features
 from signs import IDLE, display_name
 
 # --------------------------------------------------
-# SETTINGS
+# PATHS & SETTINGS
 # --------------------------------------------------
-HAND_MODEL_PATH = "hand_landmarker.task"
-FACE_MODEL_PATH = "blaze_face_short_range.tflite"
-CLASSIFIER_FILE = "model.pkl"
-SEQ_DIR = "data/sequences"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+HAND_MODEL_PATH = os.path.join(BASE_DIR, "hand_landmarker.task")
+FACE_MODEL_PATH = os.path.join(BASE_DIR, "blaze_face_short_range.tflite")
+CLASSIFIER_FILE = os.path.join(BASE_DIR, "model.pkl")
+SEQ_DIR = os.path.join(BASE_DIR, "data", "sequences")
 
 WINDOW_SECONDS = 1.5
 PREDICT_EVERY = 3
@@ -56,7 +59,7 @@ class Engine:
         )
         self.face_tracker = FaceTracker(FACE_MODEL_PATH)
 
-        # In-memory queue to receive frames sent from the browser
+        # Buffer incoming frames sent from client browser
         self.frame_queue = queue.Queue(maxsize=2)
 
         self.lock = threading.Lock()
@@ -143,7 +146,7 @@ class Engine:
                 "settings": self.settings,
             }
 
-    # ---------------- main loop (processes frames arriving from browser) ----------------
+    # ---------------- main inference loop ----------------
     def run(self):
         buffer = deque()
         recent = deque(maxlen=STABLE_WINDOW)
@@ -247,12 +250,20 @@ class Engine:
 
 
 engine = Engine()
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+app = Flask(__name__, static_folder=STATIC_DIR, template_folder=STATIC_DIR)
+
+
+@app.after_request
+def add_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    return render_template("index.html")
 
 
 @app.route("/api/frame", methods=["POST"])
@@ -361,6 +372,6 @@ def api_settings():
 
 if __name__ == "__main__":
     threading.Thread(target=engine.run, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))[cite: 2]
     print(f"SignLab running -> http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
