@@ -1,17 +1,10 @@
-# server.py - SignLab backend.
-# Runs the SAME recognition pipeline as predict.py (same preprocess, same model.pkl,
-# same thresholds) inside a background thread, and exposes it to a web UI:
-#   /video   MJPEG stream of the annotated camera
-#   /events  live state (Server-Sent Events)
-#   /api/*   add / delete / clear / speak / practice / correct / settings
-#
-# Run:  pip install flask   then   python server.py   ->  open http://127.0.0.1:5000
-# Close predict.py first (only one program can use the camera).
-
+# server.py - SignLab backend (Web-ready version)
+import base64
 import datetime
 import glob
 import json
 import os
+import queue
 import threading
 import time
 from collections import Counter, deque
@@ -30,8 +23,7 @@ from preprocess import extract_frame_raw, resample_by_time, sequence_features
 from signs import IDLE, display_name
 
 # --------------------------------------------------
-# SETTINGS (identical to predict.py - do not change these to "tune" accuracy,
-# use the live slider in the UI instead)
+# SETTINGS
 # --------------------------------------------------
 HAND_MODEL_PATH = "hand_landmarker.task"
 FACE_MODEL_PATH = "blaze_face_short_range.tflite"
@@ -63,9 +55,9 @@ class Engine:
             )
         )
         self.face_tracker = FaceTracker(FACE_MODEL_PATH)
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise SystemExit("Could not access camera. Close predict.py / other apps using it.")
+
+        # In-memory queue to receive frames sent from the browser
+        self.frame_queue = queue.Queue(maxsize=2)
 
         self.lock = threading.Lock()
         self.jpeg = None
@@ -115,17 +107,16 @@ class Engine:
         with self.lock:
             glosses = self._glosses()
             use_llm = self.settings["use_llm"]
-        text = to_sentence(glosses, use_llm=use_llm) if glosses else ""   # may take up to 3 s
+        text = to_sentence(glosses, use_llm=use_llm) if glosses else ""
         with self.lock:
             self.corrected = text
         return text
 
     def save_sample(self, sign):
-        """Store the current 1.5 s window as a new training clip for `sign`."""
         with self.lock:
             seq = None if self.last_seq is None else self.last_seq.copy()
         if seq is None or not seq[:, :126].any():
-            return False                                   # no hand in the window
+            return False
         d = os.path.join(SEQ_DIR, sign)
         os.makedirs(d, exist_ok=True)
         stamp = datetime.date.today().strftime("%Y%m%d")
@@ -152,7 +143,7 @@ class Engine:
                 "settings": self.settings,
             }
 
-    # ---------------- main loop (same logic as predict.py) ----------------
+    # ---------------- main loop (processes frames arriving from browser) ----------------
     def run(self):
         buffer = deque()
         recent = deque(maxlen=STABLE_WINDOW)
@@ -163,19 +154,18 @@ class Engine:
         t_prev = time.time()
 
         while self.running:
-            ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.05)
+            try:
+                frame = self.frame_queue.get(timeout=0.2)
+            except queue.Empty:
                 continue
 
-            frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             now = time.time()
             frame_count += 1
             self.fps = 0.9 * self.fps + 0.1 * (1.0 / max(now - t_prev, 1e-3))
             t_prev = now
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)      # detection uses the RAW frame
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             hands = self.detector.detect(mp_image).hand_landmarks
             face = self.face_tracker.update(mp_image, w, h)
@@ -222,14 +212,14 @@ class Engine:
                     if votes >= STABLE_COUNT and word != locked:
                         with self.lock:
                             target = self.practice["target"]
-                            if target:                                  # practice mode
+                            if target:
                                 if word == target:
                                     self.practice["success_id"] += 1
                                     self.practice["last_success"] = target
                                     self.practice["target"] = None
                                     locked = word
                                     recent.clear()
-                            else:                                       # translate mode
+                            else:
                                 self.sentence.append(str(word))
                                 self._refresh_text()
                                 self.added_id += 1
@@ -248,11 +238,10 @@ class Engine:
                 else:
                     self.status = "ready"
 
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ok:
                 self.jpeg = buf.tobytes()
 
-        self.cap.release()
         self.detector.close()
         self.face_tracker.close()
 
@@ -266,6 +255,34 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.route("/api/frame", methods=["POST"])
+def api_frame():
+    data = request.get_json(silent=True)
+    if not data or "image" not in data:
+        return jsonify(ok=False), 400
+
+    img_b64 = data["image"]
+    if "," in img_b64:
+        img_b64 = img_b64.split(",", 1)[1]
+
+    try:
+        raw_bytes = base64.b64decode(img_b64)
+        np_arr = np.frombuffer(raw_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            if engine.frame_queue.full():
+                try:
+                    engine.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            engine.frame_queue.put(frame)
+            return jsonify(ok=True)
+    except Exception:
+        pass
+
+    return jsonify(ok=False), 400
+
+
 @app.route("/video")
 def video():
     def gen():
@@ -275,7 +292,7 @@ def video():
             if jpg is not None and jpg is not last:
                 last = jpg
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            time.sleep(0.02)
+            time.sleep(0.03)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -301,7 +318,6 @@ def api_add():
 
 @app.route("/api/correct", methods=["POST"])
 def api_correct():
-    """User says 'that was really X': add it AND save the window as training data."""
     sign = request.json.get("sign", "")
     saved = engine.save_sample(sign) if sign in engine.words else False
     return jsonify(ok=engine.add_word(sign), saved=saved)
