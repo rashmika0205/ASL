@@ -372,6 +372,6 @@ def api_settings():
 
 if __name__ == "__main__":
     threading.Thread(target=engine.run, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))[cite: 2]
+    port = int(os.environ.get("PORT", 5000))
     print(f"SignLab running -> http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
