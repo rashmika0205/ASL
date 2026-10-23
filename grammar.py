@@ -12,6 +12,10 @@
 #   I BAD  I WANT HELP         ->  "I feel bad, so I want help."
 # Questions and greetings (HELLO, BYE, THANK YOU) stay as their own sentences.
 #
+# Questions (WHERE / WHAT) work in either word order, like real ASL:
+#   WHERE YOU HOME   /  YOU HOME WHERE   ->  "Where is your home?"
+#   YOU WANT EAT WHAT                    ->  "What do you want to eat?"
+#
 # Two modes:
 #   1. LLM (needs internet + `pip install anthropic` + ANTHROPIC_API_KEY env var)
 #   2. Rule-based fallback (offline, deterministic) - used automatically if the LLM call fails.
@@ -25,6 +29,13 @@ SYSTEM = (
     "signed again), join them into one sentence with a fitting conjunction: 'and', 'but', 'so', "
     "'because' or 'and then'. Keep questions and greetings as separate sentences. "
     "Do not invent new meaning or extra content. Treat 'YOU NAME WHAT' as 'What is your name?'. "
+    "ASL puts question words at the start or the end, so treat 'WHERE YOU HOME' and "
+    "'YOU HOME WHERE' both as 'Where is your home?'. "
+    "A pronoun (I/YOU) next to a noun in a WHERE/WHAT question is a possessive: "
+    "'WHERE I HOME' = 'Where is my home?'. "
+    "More examples: 'WHERE YOU' = 'Where are you?'; 'WHERE EAT' = 'Where can I eat?'; "
+    "'WHERE YOU WANT HOME' = 'Where do you want to go?'; "
+    "'YOU WANT EAT WHAT' = 'What do you want to eat?'; 'I WANT YOU HELP' = 'I want you to help me.' "
     "Output ONLY the final text, nothing else."
 )
 
@@ -39,6 +50,63 @@ PREDICATES = {"WANT", "EAT", "HELP", "WATER", "TOILET", "HOME", "GOOD", "BAD", "
 NEEDS = {"WANT", "HELP", "EAT", "TOILET", "WATER", "HOME"}
 # a new idea never starts right after one of these (they still need their object)
 NEEDS_OBJECT = {"WANT", "WHERE", "WHAT", "NAME"}
+
+# nouns that can be "owned" in a question: WHERE YOU HOME -> "Where is your home?"
+NOUNS = {"HOME": "home", "WATER": "water", "TOILET": "toilet"}
+POSS = {"I": "my", "YOU": "your"}
+
+
+def _where(c, please=False):
+    """
+    Build a WHERE question from the remaining glosses (WHERE already removed).
+    Order does not matter: WHERE YOU HOME == YOU HOME WHERE.
+    Returns None if no special pattern matches (caller falls back to generic).
+    """
+    subj = next((w for w in c if w in SUBJECTS), None)
+    noun = next((w for w in c if w in NOUNS), None)
+    s = "I" if subj == "I" else "you"
+
+    # WHERE YOU WANT HOME / WHERE YOU WANT EAT
+    if "WANT" in c:
+        if "EAT" in c:
+            return f"Where do {s} want to eat?"
+        if "HOME" in c or "TOILET" in c:
+            return f"Where do {s} want to go?"
+        return None
+
+    # WHERE YOU HOME -> Where is your home?   WHERE I WATER -> Where is my water?
+    if noun and subj:
+        return f"Where is {POSS[subj]} {NOUNS[noun]}?"
+
+    # WHERE HOME / WHERE WATER / WHERE TOILET
+    if noun:
+        if noun == "HOME":
+            return "Where is home?"
+        return f"Where is the {NOUNS[noun]}?"
+
+    if "EAT" in c:
+        return "Where do you eat?" if subj == "YOU" else "Where can I eat?"
+    if "HELP" in c:
+        return "Where can I get help?"
+    if subj == "YOU":
+        return "Where are you?"
+    if subj == "I":
+        return "Where am I?"
+    return None
+
+
+def _what(c, tail=""):
+    """Build a WHAT question from the remaining glosses (WHAT already removed)."""
+    if "NAME" in c:
+        who = "my" if ("I" in c and "YOU" not in c) else "your"
+        return f"What is {who} name{tail}?"
+    if "WANT" in c:
+        if "EAT" in c:
+            return f"What do you want to eat{tail}?"
+        return f"What do you want{tail}?"
+    if "EAT" in c:
+        return f"What do you eat{tail}?"
+    return "What?"
 
 
 def _clause(c):
@@ -59,6 +127,19 @@ def _clause(c):
             q = qw
             c = [w for w in c if w != qw]
 
+    tail = ", please" if please else ""
+
+    # ---- questions are handled by their own rules first ----
+    if q == "WHAT":
+        return _what(c, tail)
+    if q == "WHERE":
+        if not c:
+            return "Where?"
+        r = _where(c, please)
+        if r:
+            return r
+        # generic fallback below
+
     out = []
     for i, w in enumerate(c):
         nxt = c[i + 1] if i + 1 < len(c) else None
@@ -66,7 +147,12 @@ def _clause(c):
         if w == "I":
             out.append("I")
         elif w == "YOU":
-            out.append("your" if nxt == "NAME" else "you")
+            if nxt == "NAME":
+                out.append("your")
+            elif prev == "WANT" and nxt == "HELP":
+                out.append("you to")          # I want you to help me
+            else:
+                out.append("you")
         elif w == "NAME":
             out.append("name")
         elif w == "WANT":
@@ -96,23 +182,8 @@ def _clause(c):
         elif w in ("YES", "NO"):
             out.append(w.capitalize() + ",")
     phrase = " ".join(out)
-    tail = ", please" if please else ""
 
-    if q == "WHAT":
-        if "NAME" in c:
-            return f"What is {phrase}{tail}?"
-        if "WANT" in c:
-            return f"What do you want{tail}?"
-        if "EAT" in c:
-            return f"What do you eat{tail}?"
-        return "What?"
     if q == "WHERE":
-        if not phrase:
-            return "Where?"
-        if phrase == "you":
-            return "Where are you?"
-        if phrase == "I":
-            return "Where am I?"
         return f"Where is {phrase}{tail}?"
 
     if please and out and out[0] in ("help me", "eat"):
@@ -136,10 +207,17 @@ def _split_ideas(words):
             units.append(("idea", cur))
             cur = []
 
-    for w in words:
+    for i, w in enumerate(words):
         if w in SOCIAL:
             flush()
             units.append(("social", w))
+            continue
+        # a WHERE with nothing after it (or only a greeting) closes the current
+        # idea as its question word:  YOU HOME WHERE -> "Where is your home?"
+        trailing_where = (w == "WHERE" and cur
+                          and all(x in SOCIAL for x in words[i + 1:]))
+        if trailing_where:
+            cur.append(w)
             continue
         if w in SUBJECTS or w == "WHERE":
             finished = (any(x in PREDICATES for x in cur)
@@ -257,6 +335,29 @@ if __name__ == "__main__":
         ["I", "WANT", "WATER", "WHERE", "TOILET"],
         ["WHERE", "TOILET", "I", "WANT", "HELP"],
         ["I", "WANT", "WATER", "YOU", "NAME", "WHAT"],
+        # NEW: more WHERE / WHAT questions (either word order)
+        ["WHERE", "YOU", "HOME"],
+        ["YOU", "HOME", "WHERE"],
+        ["WHERE", "I", "HOME"],
+        ["WHERE", "YOU", "WATER"],
+        ["WHERE", "HOME"],
+        ["WHERE", "WATER"],
+        ["WHERE", "YOU"],
+        ["WHERE", "I"],
+        ["WHERE", "EAT"],
+        ["WHERE", "YOU", "EAT"],
+        ["WHERE", "HELP"],
+        ["WHERE", "YOU", "WANT", "HOME"],
+        ["WHERE", "YOU", "WANT", "EAT"],
+        ["YOU", "WANT", "EAT", "WHAT"],
+        ["YOU", "WANT", "WHAT"],
+        ["WHAT", "YOU", "EAT"],
+        ["I", "NAME", "WHAT"],
+        ["I", "WANT", "YOU", "HELP"],
+        # NEW: questions mixed with other ideas
+        ["HELLO", "WHERE", "YOU", "HOME"],
+        ["I", "WANT", "WATER", "WHERE", "YOU", "HOME"],
+        ["WHERE", "YOU", "HOME", "I", "WANT", "HELP"],
     ]
     for t in tests:
         print(" ".join(t), "->", rule_based(t))

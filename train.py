@@ -11,7 +11,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from preprocess import FRAME_RAW_VALUES, SEQ_LEN, sequence_features
 from signs import SIGNS
@@ -26,6 +25,7 @@ CONFUSION_FILE = "confusion_matrix.png"
 
 RANDOM_STATE = 42
 MIN_CLIPS_PER_SIGN = 40
+SAME_SESSION_TEST_FRACTION = 0.25   # used only for signs recorded in one session
 
 # --------------------------------------------------
 # LOAD CLIPS
@@ -57,36 +57,55 @@ if not X:
 X = np.array(X)
 y = np.array(y)
 groups = np.array(groups)
-sessions = sorted(set(groups))
 
 print(f"\nTotal clips: {len(X)}   Features per clip: {X.shape[1]}")
-print(f"Recording sessions: {len(sessions)}")
+print(f"Recording sessions: {len(set(groups))}")
 
 # --------------------------------------------------
-# SPLIT
+# SPLIT (every sign is always present in training)
+#   sign recorded in 2+ sessions -> its NEWEST session is the test set
+#                                   ("cross-session": honest accuracy)
+#   sign recorded in 1 session   -> its LAST 25% of clips are the test set
+#                                   ("same-session": optimistic accuracy)
 # --------------------------------------------------
 
-if len(sessions) >= 3:
-    # whole sessions go to either train or test -> honest accuracy
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.25,
-                                 random_state=RANDOM_STATE)
-    train_idx, test_idx = next(splitter.split(X, y, groups))
-    print("Split by recording session (honest test).")
-else:
-    train_idx, test_idx = train_test_split(
-        np.arange(len(X)), test_size=0.2, random_state=RANDOM_STATE,
-        stratify=y,
-    )
-    print("NOTE: fewer than 3 sessions, so test clips come from the same "
-          "sessions as training clips and accuracy will look better than it is. "
-          "Record in 3+ separate sessions for a fairer number.")
+train_idx, test_idx, test_kind = [], [], []
+single_session = []
+
+print("\nSign        sessions  train  test  test type")
+for sign in sorted(set(y)):
+    idx = np.where(y == sign)[0]            # already in time order (files sorted by name)
+    sess = sorted(set(groups[idx]))
+
+    if len(sess) >= 2:
+        held = sess[-1]
+        test = idx[groups[idx] == held]
+        train = idx[groups[idx] != held]
+        kind = "cross-session"
+    else:
+        single_session.append(sign)
+        cut = max(1, int(round(len(idx) * (1 - SAME_SESSION_TEST_FRACTION))))
+        train, test = idx[:cut], idx[cut:]
+        kind = "same-session"
+
+    train_idx += list(train)
+    test_idx += list(test)
+    test_kind += [kind] * len(test)
+    print(f"{sign:11s} {len(sess):8d} {len(train):6d} {len(test):5d}  {kind}")
+
+test_kind = np.array(test_kind)
+train_idx, test_idx = np.array(train_idx), np.array(test_idx)
 
 X_train, X_test = X[train_idx], X[test_idx]
 y_train, y_test = y[train_idx], y[test_idx]
 
-missing = set(y) - set(y_train)
-if missing:
-    print(f"WARNING: no training clips for {sorted(missing)} in this split.")
+if single_session:
+    print(f"\nNOTE: {len(single_session)} signs were recorded in only ONE session "
+          f"({', '.join(single_session)}).")
+    print("      Their test score is optimistic and the model has not seen them in "
+          "another setting.")
+    print("      Record them again in a separate run of collect_sequences.py "
+          "(different time, light or position).")
 
 # --------------------------------------------------
 # TRAIN + EVALUATE
@@ -106,7 +125,14 @@ model = make_model()
 model.fit(X_train, y_train)
 y_pred = model.predict(X_test)
 
-print(f"\nTest accuracy: {accuracy_score(y_test, y_pred):.3f}\n")
+print(f"\nOverall test accuracy: {accuracy_score(y_test, y_pred):.3f}")
+for kind in ("cross-session", "same-session"):
+    mask = test_kind == kind
+    if mask.any():
+        acc = accuracy_score(y_test[mask], y_pred[mask])
+        print(f"  {kind:14s}: {acc:.3f}  ({mask.sum()} clips)"
+              + ("   <- the honest number" if kind == "cross-session" else ""))
+print()
 
 present = sorted(set(y_test) | set(y_pred))
 print(classification_report(y_test, y_pred, labels=present, zero_division=0))
@@ -119,7 +145,7 @@ pairs = [(cm[i, j], present[i], present[j])
 pairs.sort(reverse=True)
 if pairs:
     print("Most confused (true -> predicted):")
-    for count, true, pred in pairs[:5]:
+    for count, true, pred in pairs[:8]:
         print(f"  {true} -> {pred}: {count}")
 
 fig, ax = plt.subplots(figsize=(12, 10))
